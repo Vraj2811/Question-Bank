@@ -1,9 +1,10 @@
 from flask import Flask, render_template, request, jsonify
-import json
 import sqlite3
 import os
 from datetime import datetime
 from pathlib import Path
+from ai import QuestionGenerator
+from paper_generation import PaperGeneration
 
 app = Flask(__name__)
 
@@ -19,20 +20,38 @@ def init_database():
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
 
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS questions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            question_type TEXT NOT NULL,
-            subject TEXT NOT NULL,
-            topic TEXT NOT NULL,
-            subtopic TEXT,
-            difficulty_level TEXT NOT NULL,
-            estimated_time INTEGER NOT NULL,
-            bloom_level TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+    # Check if the table exists and get its schema
+    cursor.execute("PRAGMA table_info(questions)")
+    columns = [row[1] for row in cursor.fetchall()]
+
+    if not columns:
+        # Create new table with all columns
+        cursor.execute('''
+            CREATE TABLE questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                question_type TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                subtopic TEXT,
+                difficulty_level TEXT NOT NULL,
+                estimated_time INTEGER NOT NULL,
+                bloom_level TEXT NOT NULL,
+                is_ai_generated BOOLEAN DEFAULT FALSE,
+                ai_generation_notes TEXT,
+                parent_question_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (parent_question_id) REFERENCES questions (id)
+            )
+        ''')
+    else:
+        # Add missing columns if they don't exist
+        if 'is_ai_generated' not in columns:
+            cursor.execute('ALTER TABLE questions ADD COLUMN is_ai_generated BOOLEAN DEFAULT FALSE')
+        if 'ai_generation_notes' not in columns:
+            cursor.execute('ALTER TABLE questions ADD COLUMN ai_generation_notes TEXT')
+        if 'parent_question_id' not in columns:
+            cursor.execute('ALTER TABLE questions ADD COLUMN parent_question_id INTEGER')
 
     conn.commit()
     conn.close()
@@ -96,7 +115,11 @@ DIFFICULTY_LEVELS = [
 
 @app.route('/')
 def index():
-    return render_template('index.html', 
+    return render_template('index.html')
+
+@app.route('/teacher')
+def teacher():
+    return render_template('teacher.html',
                          question_types=QUESTION_TYPES,
                          bloom_levels=BLOOM_LEVELS,
                          difficulty_levels=DIFFICULTY_LEVELS)
@@ -114,6 +137,8 @@ def submit_question():
         difficulty_level = request.form.get('difficulty_level')
         estimated_time = request.form.get('estimated_time')
         bloom_level = request.form.get('bloom_level')
+        generate_ai_questions = request.form.get('generate_ai_questions') == 'on'
+        ai_notes = request.form.get('ai_notes', '')
 
         # Validate required fields
         if not all([title, full_question_text, question_type, subject, topic,
@@ -123,26 +148,77 @@ def submit_question():
                 'message': 'All required fields must be filled'
             }), 400
 
-        # Insert into database
+        # Insert original question into database
         conn = sqlite3.connect(DATABASE_PATH)
         cursor = conn.cursor()
 
         cursor.execute('''
             INSERT INTO questions (title, question_type, subject, topic, subtopic,
-                                 difficulty_level, estimated_time, bloom_level)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                 difficulty_level, estimated_time, bloom_level,
+                                 is_ai_generated, ai_generation_notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (title, question_type, subject, topic, subtopic,
-              difficulty_level, int(estimated_time), bloom_level))
+              difficulty_level, int(estimated_time), bloom_level, False, None))
 
         question_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
 
         # Create folder structure
         folder_path = create_folder_structure(subject, topic, subtopic)
 
         # Save markdown file
         file_path = save_markdown_file(folder_path, question_id, full_question_text)
+
+        generated_questions = []
+
+        # Generate AI questions if requested
+        if generate_ai_questions:
+            try:
+                api_key = os.getenv("OPENAI_API_KEY")
+                if api_key:
+                    generator = QuestionGenerator(api_key)
+
+                    # Generate 3 AI questions based on the original
+                    ai_questions = generator.generate_multiple_questions(
+                        question_markdown=full_question_text,
+                        difficulty=difficulty_level,
+                        bloom_level=bloom_level,
+                        count=3,
+                        additional_notes=ai_notes
+                    )
+
+                    # Save each AI-generated question
+                    for i, ai_question in enumerate(ai_questions):
+                        ai_title = f"{title} - AI Variant {i+1}"
+
+                        cursor.execute('''
+                            INSERT INTO questions (title, question_type, subject, topic, subtopic,
+                                                 difficulty_level, estimated_time, bloom_level,
+                                                 is_ai_generated, ai_generation_notes, parent_question_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (ai_title, question_type, subject, topic, subtopic,
+                              difficulty_level, int(estimated_time), bloom_level, True, ai_notes, question_id))
+
+                        ai_question_id = cursor.lastrowid
+                        ai_file_path = save_markdown_file(folder_path, ai_question_id, ai_question)
+
+                        generated_questions.append({
+                            'id': ai_question_id,
+                            'title': ai_title,
+                            'file_path': ai_file_path
+                        })
+
+                else:
+                    return jsonify({
+                        'status': 'error',
+                        'message': 'OpenAI API key not configured. Cannot generate AI questions.'
+                    }), 400
+
+            except Exception as ai_error:
+                # Continue with original question even if AI generation fails
+                print(f"AI generation error: {ai_error}")
+
+        conn.commit()
+        conn.close()
 
         # Prepare response data
         question_data = {
@@ -156,12 +232,18 @@ def submit_question():
             'estimated_time': estimated_time,
             'bloom_level': bloom_level,
             'file_path': file_path,
+            'ai_generated_count': len(generated_questions),
+            'ai_questions': generated_questions,
             'created_at': datetime.now().isoformat()
         }
 
+        message = f'Question submitted successfully! Saved as ID: {question_id}'
+        if generated_questions:
+            message += f' with {len(generated_questions)} AI-generated variants.'
+
         return jsonify({
             'status': 'success',
-            'message': f'Question submitted successfully! Saved as ID: {question_id}',
+            'message': message,
             'data': question_data
         })
 
@@ -197,7 +279,8 @@ def view_questions():
 
         cursor.execute('''
             SELECT id, title, question_type, subject, topic, subtopic,
-                   difficulty_level, estimated_time, bloom_level, created_at
+                   difficulty_level, estimated_time, bloom_level,
+                   is_ai_generated, ai_generation_notes, parent_question_id, created_at
             FROM questions
             ORDER BY created_at DESC
         ''')
@@ -214,7 +297,10 @@ def view_questions():
                 'difficulty_level': row[6],
                 'estimated_time': row[7],
                 'bloom_level': row[8],
-                'created_at': row[9]
+                'is_ai_generated': row[9],
+                'ai_generation_notes': row[10],
+                'parent_question_id': row[11],
+                'created_at': row[12]
             })
 
         conn.close()
@@ -229,6 +315,287 @@ def view_questions():
         return jsonify({
             'status': 'error',
             'message': str(e)
+        }), 400
+
+@app.route('/practice')
+def practice():
+    """Student practice interface"""
+    return render_template('practice.html')
+
+@app.route('/api/practice/tree')
+def get_practice_tree():
+    """Get hierarchical tree structure for practice"""
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT DISTINCT subject, topic, subtopic, COUNT(*) as question_count
+            FROM questions
+            GROUP BY subject, topic, subtopic
+            ORDER BY subject, topic, subtopic
+        ''')
+
+        tree = {}
+        for row in cursor.fetchall():
+            subject, topic, subtopic, count = row
+
+            if subject not in tree:
+                tree[subject] = {}
+
+            if topic not in tree[subject]:
+                tree[subject][topic] = {}
+
+            subtopic_key = subtopic if subtopic else "General"
+            tree[subject][topic][subtopic_key] = count
+
+        conn.close()
+
+        return jsonify({
+            'status': 'success',
+            'tree': tree
+        })
+
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 400
+
+@app.route('/api/practice/questions')
+def get_practice_questions():
+    """Get questions for practice based on filters"""
+    try:
+        subject = request.args.get('subject')
+        topic = request.args.get('topic')
+        subtopic = request.args.get('subtopic')
+
+        conn = sqlite3.connect(DATABASE_PATH)
+        cursor = conn.cursor()
+
+        query = '''
+            SELECT id, title, question_type, difficulty_level, estimated_time, bloom_level
+            FROM questions
+            WHERE subject = ? AND topic = ?
+        '''
+        params = [subject, topic]
+
+        if subtopic and subtopic != "General":
+            query += ' AND subtopic = ?'
+            params.append(subtopic)
+        elif subtopic == "General":
+            query += ' AND (subtopic IS NULL OR subtopic = "")'
+
+        query += ' ORDER BY difficulty_level, title'
+
+        cursor.execute(query, params)
+
+        questions = []
+        for row in cursor.fetchall():
+            questions.append({
+                'id': row[0],
+                'title': row[1],
+                'question_type': row[2],
+                'difficulty_level': row[3],
+                'estimated_time': row[4],
+                'bloom_level': row[5]
+            })
+
+        conn.close()
+
+        return jsonify({
+            'status': 'success',
+            'questions': questions
+        })
+
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 400
+
+@app.route('/api/practice/question/<int:question_id>')
+def get_question_content(question_id):
+    """Get full question content for practice"""
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT title, question_type, subject, topic, subtopic,
+                   difficulty_level, estimated_time, bloom_level
+            FROM questions
+            WHERE id = ?
+        ''', (question_id,))
+
+        question_data = cursor.fetchone()
+        if not question_data:
+            return jsonify({
+                'status': 'error',
+                'message': 'Question not found'
+            }), 404
+
+        # Read markdown file
+        subject, topic, subtopic = question_data[2], question_data[3], question_data[4]
+        folder_path = create_folder_structure(subject, topic, subtopic)
+        file_path = folder_path / f"{question_id}.md"
+
+        content = ""
+        if file_path.exists():
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+        conn.close()
+
+        return jsonify({
+            'status': 'success',
+            'question': {
+                'id': question_id,
+                'title': question_data[0],
+                'question_type': question_data[1],
+                'subject': question_data[2],
+                'topic': question_data[3],
+                'subtopic': question_data[4],
+                'difficulty_level': question_data[5],
+                'estimated_time': question_data[6],
+                'bloom_level': question_data[7],
+                'content': content
+            }
+        })
+
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 400
+
+@app.route('/create_paper')
+def create_paper():
+    """Paper generation interface"""
+    return render_template('create_paper.html',
+                         question_types=QUESTION_TYPES,
+                         bloom_levels=BLOOM_LEVELS,
+                         difficulty_levels=DIFFICULTY_LEVELS)
+
+@app.route('/api/paper/subjects')
+def get_paper_subjects():
+    """Get available subjects for paper generation"""
+    try:
+        paper_gen = PaperGeneration(DATABASE_PATH)
+        subjects = paper_gen.get_available_subjects()
+
+        return jsonify({
+            'status': 'success',
+            'subjects': subjects
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 400
+
+@app.route('/api/paper/topics')
+def get_paper_topics():
+    """Get available topics for a subject"""
+    try:
+        subject = request.args.get('subject')
+        if not subject:
+            return jsonify({
+                'status': 'error',
+                'message': 'Subject parameter is required'
+            }), 400
+
+        paper_gen = PaperGeneration(DATABASE_PATH)
+        topics = paper_gen.get_topics_for_subject(subject)
+
+        return jsonify({
+            'status': 'success',
+            'topics': topics
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 400
+
+@app.route('/api/paper/subtopics')
+def get_paper_subtopics():
+    """Get available subtopics for a subject and topic"""
+    try:
+        subject = request.args.get('subject')
+        topic = request.args.get('topic')
+
+        if not subject or not topic:
+            return jsonify({
+                'status': 'error',
+                'message': 'Subject and topic parameters are required'
+            }), 400
+
+        paper_gen = PaperGeneration(DATABASE_PATH)
+        subtopics = paper_gen.get_subtopics_for_topic(subject, topic)
+
+        return jsonify({
+            'status': 'success',
+            'subtopics': subtopics
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 400
+
+@app.route('/api/paper/generate', methods=['POST'])
+def generate_paper():
+    """Generate a question paper based on criteria"""
+    try:
+        criteria = request.json
+
+        # Validate required fields
+        if not criteria.get('total_questions'):
+            return jsonify({
+                'status': 'error',
+                'message': 'Total questions is required'
+            }), 400
+
+        paper_gen = PaperGeneration(DATABASE_PATH)
+        result = paper_gen.generate_paper(criteria)
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'Error generating paper: {str(e)}'
+        }), 400
+
+@app.route('/api/paper/save', methods=['POST'])
+def save_paper():
+    """Save generated paper to file"""
+    try:
+        data = request.json
+        paper_data = data.get('paper_data')
+        filename = data.get('filename', f'paper_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+        format_type = data.get('format', 'markdown')
+
+        if not paper_data:
+            return jsonify({
+                'status': 'error',
+                'message': 'Paper data is required'
+            }), 400
+
+        paper_gen = PaperGeneration(DATABASE_PATH)
+        file_path = paper_gen.save_paper_to_file(paper_data, filename, format_type)
+
+        return jsonify({
+            'status': 'success',
+            'message': 'Paper saved successfully',
+            'file_path': file_path
+        })
+
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'Error saving paper: {str(e)}'
         }), 400
 
 if __name__ == '__main__':
